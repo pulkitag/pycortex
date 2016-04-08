@@ -59,8 +59,8 @@ class Transform(object):
     def save(self, subject, name, xfmtype="magnet"):
         if self.reference is None:
             raise ValueError('Cannot save reference-free transforms into the database')
-        from .db import surfs
-        surfs.loadXfm(subject, name, self.xfm, xfmtype=xfmtype, reference=self.reference.get_filename())
+        from .database import db
+        db.save_xfm(subject, name, self.xfm, xfmtype=xfmtype, reference=self.reference.get_filename())
 
     @classmethod
     def from_fsl(cls, xfm, func_nii, anat_nii):
@@ -74,7 +74,8 @@ class Transform(object):
         ----------
         xfm : array
             4x4 transformation matrix, loaded from an FSL .mat file, for a transform computed 
-            FROM the func_nii volume TO the anat_nii volume.
+            FROM the func_nii volume TO the anat_nii volume. Alternatively, a string file name
+            for the FSL .mat file.
         anat_nii : str or nibabel.Nifti1Image
             nibabel image object (or path to nibabel-readable image) for anatomical volume from 
             which cortical surface was created
@@ -98,6 +99,12 @@ class Transform(object):
         import nibabel
         import numpy.linalg as npl
         inv = npl.inv
+
+        # Load transform from text file, if string is provided
+        if isinstance(xfm,(str,unicode)):
+            with open(xfm,'r') as fid:
+                L = fid.readlines()
+            xfm  = np.array([[np.float(s) for s in ll.split() if s] for ll in L])
 
         # Internally, pycortex computes the OPPOSITE transform: from anatomical volume to functional volume. 
         # Thus, assign anat to "infile" (starting point for transform)
@@ -151,7 +158,7 @@ class Transform(object):
         Notes
         -----
         This function will only work for "coord" transform objects, (those retrieved with 
-        cortex.surfs.getXfm(xfmtype='coord',...)). It will fail hard for "magnet" transforms!
+        cortex.db.get_xfm(xfmtype='coord',...)). It will fail hard for "magnet" transforms!
 
         """
         import nibabel

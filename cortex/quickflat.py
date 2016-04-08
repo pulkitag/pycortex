@@ -1,27 +1,28 @@
 import io
 import os
-import sys
-import time
 import glob
-import pickle
 import binascii
 import numpy as np
 
 from . import utils
 from . import dataset
-from .db import surfs
+from .database import db
 from .options import config
 
-def make_figure(braindata, recache=False, pixelwise=True, thick=32, sampler='nearest', height=1024, dpi=100, depth=0.5,
-                with_rois=True, with_labels=True, with_colorbar=True, with_borders=False, with_dropout=False, with_curvature=False,
-                linewidth=None, linecolor=None, roifill=None, shadow=None, labelsize=None, labelcolor=None,
-                cutout=None,cvmin=None,cvmax=None,cvthr=None,fig=None,**kwargs):
-    """Show a VolumeData or VertexData on a flatmap with matplotlib. Additional kwargs are passed on to
+def make_figure(braindata, recache=False, pixelwise=True, thick=32, sampler='nearest',
+                height=1024, dpi=100, depth=0.5, with_rois=True, with_sulci=False,
+                with_labels=True, with_colorbar=True, with_borders=False, 
+                with_dropout=False, with_curvature=False, extra_disp=None, 
+                linewidth=None, linecolor=None, roifill=None, shadow=None,
+                labelsize=None, labelcolor=None, cutout=None, cvmin=None,
+                cvmax=None, cvthr=None, fig=None, extra_hatch=None,
+                colorbar_ticks=None, colorbar_location=(.4, .07, .2, .04), **kwargs):
+    """Show a Volume or Vertex on a flatmap with matplotlib. Additional kwargs are passed on to
     matplotlib's imshow command.
 
     Parameters
     ----------
-    braindata : DataView
+    braindata : Dataview
         the data you would like to plot on a flatmap
     recache : bool
         If True, recache the flatmap cache. Useful if you've made changes to the alignment
@@ -30,17 +31,25 @@ def make_figure(braindata, recache=False, pixelwise=True, thick=32, sampler='nea
     thick : int
         Number of layers through the cortical sheet to sample. Only applies for pixelwise = True
     sampler : str
-        Name of sampling function used to sample underlying volume data
+        Name of sampling function used to sample underlying volume data. Options include 
+        'trilinear','nearest','lanczos'; see functions in cortex.mapper.samplers.py for all options
     height : int
-        Height of the image to render. Automatically scales the width for the aspect of the subject's flatmap
+        Height of the image to render. Automatically scales the width for the aspect
+        of the subject's flatmap
+    depth : float
+        Value between 0 and 1 for how deep to sample the surface for the flatmap (0 = gray/white matter
+        boundary, 1 = pial surface)
     with_rois, with_labels, with_colorbar, with_borders, with_dropout, with_curvature : bool, optional
-        Display the rois, labels, colorbar, annotated flatmap borders, and cross-hatch dropout?
+        Display the rois, labels, colorbar, annotated flatmap borders, or cross-hatch dropout?
     cutout : str
-        Name of flatmap cutout with which to clip the full flatmap. Should be the name of a sub-layer of the "cutouts" layer in <filestore>/<subject>/display.svg
+        Name of flatmap cutout with which to clip the full flatmap. Should be the name
+        of a sub-layer of the 'cutouts' layer in <filestore>/<subject>/rois.svg
+
     Other Parameters
     ----------------
     dpi : int
-        DPI of the generated image. Only applies to the scaling of matplotlib elements, specifically the colormap
+        DPI of the generated image. Only applies to the scaling of matplotlib elements,
+        specifically the colormap
     linewidth : int, optional
         Width of ROI lines. Defaults to roi options in your local `options.cfg`
     linecolor : tuple of float, optional
@@ -59,37 +68,65 @@ def make_figure(braindata, recache=False, pixelwise=True, thick=32, sampler='nea
         Maximum value for background curvature colormap. Defaults to config file value.
     cvthr : bool,optional
         Apply threshold to background curvature
+    extra_disp : tuple, optional
+        Optional extra display layer from external .svg file. Tuple specifies (filename,layer)
+        filename should be a full path. External svg file should be structured exactly as 
+        rois.svg for the subject. (Best to just copy rois.svg somewhere else and add layers to it)
+        Default value is None.
+    extra_hatch : tuple, optional
+        Optional extra crosshatch-textured layer, given as (DataView, [r, g, b]) tuple. 
+    colorbar_location : tuple, optional
+        Location of the colorbar! Not sure of what the numbers actually mean. Left, bottom, width, height, maybe?
+
     """
-    from matplotlib import cm, pyplot as plt
+    from matplotlib import colors,cm, pyplot as plt
     from matplotlib.collections import LineCollection
 
     dataview = dataset.normalize(braindata)
-    if not isinstance(dataview, dataset.DataView):
-        raise TypeError('Please provide a DataView, not a Dataset')
-    if dataview.data.movie:
-        raise ValueError('Cannot flatten movie volumes')
+    if not isinstance(dataview, dataset.Dataview):
+        raise TypeError('Please provide a Dataview, not a Dataset')
     
-    im, extents = make(dataview.data, recache=recache, pixelwise=pixelwise, sampler=sampler, height=height, thick=thick, depth=depth)
-    
+    if fig is None:
+        fig_resize = True
+        fig = plt.figure()
+    else:
+        fig_resize = False
+        fig = plt.figure(fig.number)
+
+    im, extents = make(dataview, recache=recache, pixelwise=pixelwise, sampler=sampler,
+                       height=height, thick=thick, depth=depth)
+
     if cutout:
-        roi = surfs.getOverlay(dataview.data.subject, type='cutouts',
-            roifill=(0.,0.,0.,0.),linecolor=(0.,0.,0.,0.),linewidth=0.)
+        roi = db.get_overlay(dataview.subject,
+                             otype='cutouts',
+                             roifill=(0.,0.,0.,0.),
+                             linecolor=(0.,0.,0.,0.),
+                             linewidth=0.)
+
         # Set ONLY desired cutout to be white
-        roi.rois[cutout].set(roifill=(1.,1.,1.,1.),linewidth=2.,linecolor=(1.,1.,1.,1.))
+        roi.rois[cutout].set(roifill=(1.,1.,1.,1.),
+                             linewidth=2.,
+                             linecolor=(1.,1.,1.,1.))
         roitex = roi.get_texture(height, labels=False)
         roitex.seek(0)
         co = plt.imread(roitex)[:,:,0] # Cutout image
-        # STUPID BULLSHIT 1-PIXEL CHECK:
+        if not np.any(co):
+            raise Exception('No pixels in cutout region %s!'%cutout)
+
+        # STUPID BUT NECESSARY 1-PIXEL CHECK:
         if any([np.abs(aa-bb)>0 and np.abs(aa-bb)<2 for aa,bb in zip(im.shape,co.shape)]):
             from scipy.misc import imresize
             co = imresize(co,im.shape[:2]).astype(np.float32)/255.
+
         # Alpha
         if im.dtype == np.uint8:
+            im = np.cast['float32'](im)/255.
             im[:,:,3]*=co
             h,w,cdim = [float(v) for v in im.shape]
         else:
             im[co==0] = np.nan
             h,w = [float(v) for v in im.shape]
+
         # set extents
         y,x = np.nonzero(co)
         l,r,t,b = extents
@@ -97,18 +134,14 @@ def make_figure(braindata, recache=False, pixelwise=True, thick=32, sampler='nea
                     x.max()/w * (l-r)+l,
                     y.min()/h * (t-b)+b,
                     y.max()/h * (t-b)+b]
+
         # bounding box indices
         iy,ix = ((y.min(),y.max()),(x.min(),x.max()))
     else:
         iy,ix = ((0,-1),(0,-1))
     
-    if fig is None:
-        fig = plt.figure()
-    else:
-        fig = plt.figure(fig.number)
-
     if with_curvature:
-        curv,ee = make(surfs.getSurfInfo(dataview.data.subject))
+        curv,ee = make(db.get_surfinfo(dataview.subject),recache=recache,height=height)
         if cutout: curv[co==0] = np.nan
         axcv = fig.add_axes((0,0,1,1))
         # Option to use thresholded curvature
@@ -128,80 +161,129 @@ def make_figure(braindata, recache=False, pixelwise=True, thick=32, sampler='nea
         axcv.set_xlim(extents[0], extents[1])
         axcv.set_ylim(extents[2], extents[3])
 
-    ax = fig.add_axes((0,0,1,1))
-    cimg = ax.imshow(im[iy[1]:iy[0]:-1,ix[0]:ix[1]], 
-        aspect='equal', 
+    kwargs = dict(aspect='equal', 
         extent=extents, 
-        cmap=dataview.cmap, 
-        vmin=dataview.vmin, 
-        vmax=dataview.vmax,
         origin='lower')
+    
+    # Check whether dataview has a cmap instance
+    cmapdict = _has_cmap(dataview)
+    kwargs.update(cmapdict)
+
+    ax = fig.add_axes((0,0,1,1))
+    cimg = ax.imshow(im[iy[1]:iy[0]:-1,ix[0]:ix[1]], **kwargs)
     ax.axis('off')
     ax.set_xlim(extents[0], extents[1])
     ax.set_ylim(extents[2], extents[3])
 
 
-    if with_colorbar:
-        cbar = fig.add_axes((.4, .07, .2, .04))
-        fig.colorbar(cimg, cax=cbar, orientation='horizontal')
+    if with_colorbar and not isinstance(dataview, dataset.Volume2D):
+        cbar = fig.add_axes(colorbar_location)
+        fig.colorbar(cimg, cax=cbar, orientation='horizontal',
+                     ticks=colorbar_ticks)
 
     if with_dropout is not False:
-        if with_dropout is True: with_dropout = 20
-        dax = fig.add_axes((0,0,1,1))
-        dmap, ee = make(utils.get_dropout(dataview.data.subject, dataview.data.xfmname,
-                                          power=with_dropout),
-                        height=height, sampler=sampler)
-        hx, hy = np.meshgrid(range(dmap.shape[1]), range(dmap.shape[0]))
-        hatchspace = 4
-        hatchpat = (hx+hy)%(2*hatchspace) < 2
-        hatchpat = np.logical_or(hatchpat, hatchpat[:,::-1]).astype(float)
-        hatchim = np.dstack([1-hatchpat]*3 + [hatchpat])
-        hatchim[:,:,3] *= (dmap>0.5).astype(float)
+        if isinstance(with_dropout, dataset.Dataview):
+            dropout_data = with_dropout
+        else:
+            if with_dropout is True:
+                dropout_power = 20 # default
+            else:
+                dropout_power = with_dropout
+
+            dropout_data = utils.get_dropout(dataview.subject, dataview.xfmname,
+                                             power=dropout_power)
+        
+        hatchim = _make_hatch_image(dropout_data, height, sampler, recache=recache)
         if cutout: hatchim[:,:,3]*=co
-        dax.imshow(hatchim[iy[1]:iy[0]:-1,ix[0]:ix[1]], aspect="equal", interpolation="nearest", extent=extents, origin='lower')
+        dax = fig.add_axes((0,0,1,1))
+        dax.imshow(hatchim[iy[1]:iy[0]:-1,ix[0]:ix[1]], aspect="equal",
+                   interpolation="nearest", extent=extents, origin='lower')
+
+    if extra_hatch is not None:
+        hatch_data, hatch_color = extra_hatch
+        hatchim = _make_hatch_image(hatch_data, height, sampler, recache=recache)
+        hatchim[:,:,0] = hatch_color[0]
+        hatchim[:,:,1] = hatch_color[1]
+        hatchim[:,:,2] = hatch_color[2]
+        if cutout: hatchim[:,:,3]*=co
+        dax = fig.add_axes((0,0,1,1))
+        dax.imshow(hatchim[iy[1]:iy[0]:-1,ix[0]:ix[1]], aspect="equal",
+                   interpolation="nearest", extent=extents, origin='lower')
     
     if with_borders:
-        border = _gen_flat_border(dataview.data.subject, im.shape[0])
+        border = _gen_flat_border(dataview.subject, im.shape[0])
         bax = fig.add_axes((0,0,1,1))
         blc = LineCollection(border[0], linewidths=3.0,
                              colors=[['r','b'][mw] for mw in border[1]])
         bax.add_collection(blc)
     
+    overlays = []
     if with_rois:
-        roi = surfs.getOverlay(dataview.data.subject,linewidth=linewidth, linecolor=linecolor, roifill=roifill, shadow=shadow, labelsize=labelsize, labelcolor=labelcolor)
-        roitex = roi.get_texture(height, labels=with_labels)
+        roi = db.get_overlay(dataview.subject,
+                             linewidth=linewidth,
+                             linecolor=linecolor,
+                             roifill=roifill,
+                             shadow=shadow,
+                             labelsize=labelsize,
+                             labelcolor=labelcolor)
+        overlays.append(roi)
+    if with_sulci:
+        sulc = db.get_overlay(dataview.subject,
+                              otype='sulci',
+                              linewidth=linewidth,
+                              linecolor=linecolor,
+                              shadow=shadow,
+                              labelsize=labelsize,
+                              labelcolor=labelcolor)
+        overlays.append(sulc)
+    if not extra_disp is None:
+        svgfile,layer = extra_disp
+        if not isinstance(layer,(list,tuple)):
+            layer = [layer]
+        for extralayer in layer:
+            # Allow multiple extra layer overlays
+            disp = db.get_overlay(dataview.subject,
+                              otype='external',
+                              shadow=shadow,
+                              labelsize=labelsize,
+                              labelcolor=labelcolor,
+                              layer=extralayer,
+                              svgfile=svgfile)
+            overlays.append(disp)
+    for oo in overlays:
+        roitex = oo.get_texture(height, labels=with_labels, size=labelsize)
         roitex.seek(0)
         oax = fig.add_axes((0,0,1,1))
         roi_im = plt.imread(roitex)
         if cutout: 
-            # STUPID BULLSHIT 1-PIXEL CHECK:
+            # STUPID BUT NECESSARY 1-PIXEL CHECK:
             if any([np.abs(aa-bb)>0 and np.abs(aa-bb)<2 for aa,bb in zip(im.shape,roi_im.shape)]):
                 from scipy.misc import imresize
                 co = imresize(co,roi_im.shape[:2]).astype(np.float32)/255.
             roi_im[:,:,3]*=co
+
         oimg = oax.imshow(roi_im[iy[1]:iy[0]:-1,ix[0]:ix[1]],
             aspect='equal', 
             interpolation='bicubic', 
             extent=extents, 
             zorder=3,
             origin='lower')
+
+    if fig_resize:
+        imsize = fig.get_axes()[0].get_images()[0].get_size()
+        fig.set_size_inches(np.array(imsize)[::-1] / float(dpi))
+        
     return fig
 
 def make_png(fname, braindata, recache=False, pixelwise=True, sampler='nearest', height=1024,
-    bgcolor=None, dpi=100, **kwargs):
-    """
-    make_png(name, braindata, recache=False, pixelwise=True, thick=32, sampler='nearest', height=1024, dpi=100,
-                with_rois=True, with_labels=True, with_colorbar=True, with_borders=False, with_dropout=False, 
-                linewidth=None, linecolor=None, roifill=None, shadow=None, labelsize=None, labelcolor=None,
-                **kwargs)
-
-    Create a PNG of the VertexData or VolumeData on a flatmap.
+             bgcolor=None, dpi=100, **kwargs):
+    """Create a PNG of the VertexData or VolumeData on a flatmap.
 
     Parameters
     ----------
     fname : str
         Filename for where to save the PNG file
-    braindata : DataView
+    braindata : Dataview
         the data you would like to plot on a flatmap
     recache : bool
         If True, recache the flatmap cache. Useful if you've made changes to the alignment
@@ -212,14 +294,21 @@ def make_png(fname, braindata, recache=False, pixelwise=True, sampler='nearest',
     sampler : str
         Name of sampling function used to sample underlying volume data
     height : int
-        Height of the image to render. Automatically scales the width for the aspect of the subject's flatmap
+        Height of the image to render. Automatically scales the width for the aspect of
+        the subject's flatmap
+    depth : float
+        Value between 0 and 1 for how deep to sample the surface for the flatmap (0 = gray/white matter
+        boundary, 1 = pial surface)        
     with_rois, with_labels, with_colorbar, with_borders, with_dropout : bool, optional
         Display the rois, labels, colorbar, annotated flatmap borders, and cross-hatch dropout?
 
     Other Parameters
     ----------------
     dpi : int
-        DPI of the generated image. Only applies to the scaling of matplotlib elements, specifically the colormap
+        DPI of the generated image. Only applies to the scaling of matplotlib elements,
+        specifically the colormap
+    bgcolor : matplotlib colorspec
+        Color of background of image. `None` gives transparent background.
     linewidth : int, optional
         Width of ROI lines. Defaults to roi options in your local `options.cfg`
     linecolor : tuple of float, optional
@@ -234,53 +323,92 @@ def make_png(fname, braindata, recache=False, pixelwise=True, sampler='nearest',
         (R, G, B, A) specification for the label color
     """
     from matplotlib import pyplot as plt
-    fig = make_figure(braindata, recache=recache, pixelwise=pixelwise, sampler=sampler, height=height, **kwargs)
+    fig = make_figure(braindata,
+                      recache=recache,
+                      pixelwise=pixelwise,
+                      sampler=sampler,
+                      height=height,
+                      **kwargs)
+    
     imsize = fig.get_axes()[0].get_images()[0].get_size()
     fig.set_size_inches(np.array(imsize)[::-1] / float(dpi))
     if bgcolor is None:
         fig.savefig(fname, transparent=True, dpi=dpi)
     else:
         fig.savefig(fname, facecolor=bgcolor, transparent=False, dpi=dpi)
-    plt.close()
+    fig.clf()
+    plt.close(fig)
 
-def make_svg(fname, braindata, recache=False, pixelwise=True, sampler='nearest', height=1024, thick=32, depth=0.5, **kwargs):
-    dataview = dataset.normalize(braindata)
-    if not isinstance(dataview, dataset.DataView):
-        raise TypeError('Please provide a DataView, not a Dataset')
-    if dataview.data.movie:
-        raise ValueError('Cannot flatten movie volumes')
-    ## Create quickflat image array
-    im, extents = make(dataview.data, recache=recache, pixelwise=pixelwise, sampler=sampler, height=height, thick=thick, depth=depth)
-    ## Convert to PNG
+def make_svg(fname, braindata, with_labels=True, **kwargs): # recache=False, pixelwise=True, sampler='nearest', height=1024, thick=32, depth=0.5, 
+    """Save an svg file of the desired flatmap.
+
+    This function creates an SVG file with vector graphic ROIs overlaid on a single png image.
+    Ideally, this function would layer different images (curvature, data, dropout, etc), but 
+    that has been left to implement at a future date if anyone really wants it. 
+
+    Parameters
+    ----------
+    fname : string
+        file name to save
+    braindata : Dataview
+        the data you would like to plot on a flatmap
+    with_labels : bool
+        Whether to display text labels on ROIs
+
+    Other Parameters
+    ----------------
+    kwargs : see make_figure
+        All kwargs are passed to make_png. `with_rois` will be ignored, because by using 
+        this function you are basically saying that you want an editable layer of vector 
+        graphic ROIs on top of your image. `with_cutouts` is not functional yet.
+    """
     try:
         import cStringIO
         fp = cStringIO.StringIO()
     except:
         fp = io.StringIO()
     from matplotlib.pylab import imsave
-    imsave(fp, im, cmap=dataview.cmap, vmin=dataview.vmin, vmax=dataview.vmax, **kwargs)
+    to_cut = ['with_rois','cutouts']
+    for cc in to_cut:
+        if cc in kwargs: 
+            _ = kwargs.pop(cc)
+    ## Render PNG file & retrieve image data
+    make_png(fp,braindata,with_rois=False,**kwargs) #recache=recache, pixelwise=pixelwise, sampler=sampler, height=height, thick=thick, depth=depth, **kwargs)
     fp.seek(0)
     pngdata = binascii.b2a_base64(fp.read())
     ## Create and save SVG file
-    roipack = utils.get_roipack(dataview.data.subject)
-    roipack.get_svg(fname, labels=True, with_ims=[pngdata])
+    roipack = utils.get_roipack(braindata.subject)
+    roipack.get_svg(fname, labels=with_labels, with_ims=[pngdata])
 
 def make(braindata, height=1024, recache=False, **kwargs):
-    if not isinstance(braindata, dataset.BrainData):
-        raise TypeError('Invalid type for quickflat')
-    if braindata.movie:
-        raise ValueError('Cannot flatten multiple volumes')
-
     mask, extents = get_flatmask(braindata.subject, height=height, recache=recache)
-
-    if isinstance(braindata, dataset.VertexData):
-        pixmap = get_flatcache(braindata.subject, None, height=height, recache=recache, **kwargs)
+    
+    if not hasattr(braindata, "xfmname"):
+        pixmap = get_flatcache(braindata.subject,
+                               None,
+                               height=height,
+                               recache=recache,
+                               **kwargs)
         data = braindata.vertices
+        if isinstance(braindata, dataset.Vertex2D):
+            data = braindata.raw.vertices
+        else:
+            data = braindata.vertices
     else:
-        pixmap = get_flatcache(braindata.subject, braindata.xfmname, height=height, recache=recache, **kwargs)
-        data = braindata.volume
+        pixmap = get_flatcache(braindata.subject,
+                               braindata.xfmname,
+                               height=height,
+                               recache=recache,
+                               **kwargs)
+        if isinstance(braindata, dataset.Volume2D):
+            data = braindata.raw.volume
+        else:
+            data = braindata.volume
 
-    if braindata.raw:
+    if data.shape[0] > 1:
+        raise ValueError("Cannot flatten movie views")
+
+    if data.dtype == np.uint8:
         img = np.zeros(mask.shape+(4,), dtype=np.uint8)
         img[mask] = pixmap * data.reshape(-1, 4)
         return img.transpose(1,0,2)[::-1], extents
@@ -322,7 +450,9 @@ def show(*args, **kwargs):
     raise DeprecationWarning("Use quickflat.make_figure instead")
     return make_figure(*args, **kwargs)
 
-def make_movie(name, data, subject, xfmname, recache=False, height=1024, sampler='nearest', dpi=100, tr=2, interp='linear', fps=30, vcodec='libtheora', bitrate="8000k", vmin=None, vmax=None, **kwargs):
+def make_movie(name, data, subject, xfmname, recache=False, height=1024,
+               sampler='nearest', dpi=100, tr=2, interp='linear', fps=30,
+               vcodec='libtheora', bitrate="8000k", vmin=None, vmax=None, **kwargs):
     raise NotImplementedError
     import sys
     import shlex
@@ -367,7 +497,7 @@ def make_movie(name, data, subject, xfmname, recache=False, height=1024, sampler
         shutil.rmtree(path)
 
 def get_flatmask(subject, height=1024, recache=False):
-    cachedir = surfs.getCache(subject)
+    cachedir = db.get_cache(subject)
     cachefile = os.path.join(cachedir, "flatmask_{h}.npz".format(h=height))
 
     if not os.path.exists(cachefile) or recache:
@@ -380,8 +510,9 @@ def get_flatmask(subject, height=1024, recache=False):
 
     return mask, extents
 
-def get_flatcache(subject, xfmname, pixelwise=True, thick=32, sampler='nearest', recache=False, height=1024, depth=0.5):
-    cachedir = surfs.getCache(subject)
+def get_flatcache(subject, xfmname, pixelwise=True, thick=32, sampler='nearest',
+                  recache=False, height=1024, depth=0.5):
+    cachedir = db.get_cache(subject)
     cachefile = os.path.join(cachedir, "flatverts_{height}.npz").format(height=height)
     if pixelwise and xfmname is not None:
         cachefile = os.path.join(cachedir, "flatpixel_{xfmname}_{height}_{sampler}_{extra}.npz")
@@ -408,12 +539,21 @@ def get_flatcache(subject, xfmname, pixelwise=True, thick=32, sampler='nearest',
 
     return pixmap
 
+def _make_hatch_image(dropout_data, height, sampler, recache=False):
+    dmap, ee = make(dropout_data, height=height, sampler=sampler, recache=recache)
+    hx, hy = np.meshgrid(range(dmap.shape[1]), range(dmap.shape[0]))
+    hatchspace = 4
+    hatchpat = (hx+hy)%(2*hatchspace) < 2
+    hatchpat = np.logical_or(hatchpat, hatchpat[:,::-1]).astype(float)
+    hatchim = np.dstack([1-hatchpat]*3 + [hatchpat])
+    hatchim[:,:,3] *= np.clip(dmap, 0, 1).astype(float)
+
+    return hatchim
 
 def _make_flatmask(subject, height=1024):
     from . import polyutils
-    import Image
-    import ImageDraw
-    pts, polys = surfs.getSurf(subject, "flat", merge=True, nudge=True)
+    from PIL import Image, ImageDraw
+    pts, polys = db.get_surf(subject, "flat", merge=True, nudge=True)
     bounds = polyutils.trace_poly(polyutils.boundary_edges(polys))
     left, right = bounds.next(), bounds.next()
     aspect = (height / (pts.max(0) - pts.min(0))[1])
@@ -431,7 +571,7 @@ def _make_flatmask(subject, height=1024):
 def _make_vertex_cache(subject, height=1024):
     from scipy import sparse
     from scipy.spatial import cKDTree
-    flat, polys = surfs.getSurf(subject, "flat", merge=True, nudge=True)
+    flat, polys = db.get_surf(subject, "flat", merge=True, nudge=True)
     valid = np.unique(polys)
     fmax, fmin = flat.max(0), flat.min(0)
     size = fmax - fmin
@@ -449,8 +589,8 @@ def _make_vertex_cache(subject, height=1024):
 
 def _make_pixel_cache(subject, xfmname, height=1024, thick=32, depth=0.5, sampler='nearest'):
     from scipy import sparse
-    from scipy.spatial import cKDTree, Delaunay
-    flat, polys = surfs.getSurf(subject, "flat", merge=True, nudge=True)
+    from scipy.spatial import Delaunay
+    flat, polys = db.get_surf(subject, "flat", merge=True, nudge=True)
     valid = np.unique(polys)
     fmax, fmin = flat.max(0), flat.min(0)
     size = fmax - fmin
@@ -473,13 +613,13 @@ def _make_pixel_cache(subject, xfmname, height=1024, thick=32, depth=0.5, sample
     ll[:,missing] = 0
 
     from cortex.mapper import samplers
-    xfm = surfs.getXfm(subject, xfmname, xfmtype='coord')
+    xfm = db.get_xfm(subject, xfmname, xfmtype='coord')
     sampclass = getattr(samplers, sampler)
 
     ## Transform fiducial vertex locations to pixel locations using barycentric xfm
     try:
-        pia, polys = surfs.getSurf(subject, "pia", merge=True, nudge=False)
-        wm, polys = surfs.getSurf(subject, "wm", merge=True, nudge=False)
+        pia, polys = db.get_surf(subject, "pia", merge=True, nudge=False)
+        wm, polys = db.get_surf(subject, "wm", merge=True, nudge=False)
         piacoords = xfm((pia[valid][dl.vertices][simps] * ll[np.newaxis].T).sum(1))
         wmcoords = xfm((wm[valid][dl.vertices][simps] * ll[np.newaxis].T).sum(1))
 
@@ -493,20 +633,21 @@ def _make_pixel_cache(subject, xfmname, height=1024, thick=32, depth=0.5, sample
             wmcoords[:,2] < xfm.shape[0]])
         valid = np.logical_and(valid_p, valid_w)
         vidx = np.nonzero(valid)[0]
-
         mapper = sparse.csr_matrix((mask.sum(), np.prod(xfm.shape)))
         if thick == 1:
             i, j, data = sampclass(piacoords[valid]*depth + wmcoords[valid]*(1-depth), xfm.shape)
-            mapper = mapper + sparse.csr_matrix((data / thick, (vidx[i], j)), shape=mapper.shape)
+            mapper = mapper + sparse.csr_matrix((data / float(thick), (vidx[i], j)),
+                                                shape=mapper.shape)
             return mapper
 
         for t in np.linspace(0, 1, thick+2)[1:-1]:
             i, j, data = sampclass(piacoords[valid]*t + wmcoords[valid]*(1-t), xfm.shape)
-            mapper = mapper + sparse.csr_matrix((data / thick, (vidx[i], j)), shape=mapper.shape)
+            mapper = mapper + sparse.csr_matrix((data / float(thick), (vidx[i], j)),
+                                                shape=mapper.shape)
         return mapper
 
     except IOError:
-        fid, polys = surfs.getSurf(subject, "fiducial", merge=True)
+        fid, polys = db.get_surf(subject, "fiducial", merge=True)
         fidcoords = xfm((fid[valid][dl.vertices][simps] * ll[np.newaxis].T).sum(1))
 
         valid = reduce(np.logical_and, [reduce(np.logical_and, (0 <= fidcoords).T),
@@ -518,6 +659,44 @@ def _make_pixel_cache(subject, xfmname, height=1024, thick=32, depth=0.5, sample
         i, j, data = sampclass(fidcoords[valid], xfm.shape)
         csrshape = mask.sum(), np.prod(xfm.shape)
         return sparse.csr_matrix((data, (vidx[i], j)), shape=csrshape)
+
+
+def _has_cmap(dataview):
+    """Checks whether a given dataview has colormap (cmap) information as an
+    instance or is an RGB volume and does not have a cmap.
+    Returns a dictionary with cmap information for non RGB volumes"""
+
+    from matplotlib import colors, cm, pyplot as plt
+
+    cmapdict = dict()
+    if not isinstance(dataview, (dataset.VolumeRGB, dataset.VertexRGB)):
+        # Get colormap from matplotlib or pycortex colormaps
+        ## -- redundant code, here and in cortex/dataset/views.py -- ##
+        if isinstance(dataview.cmap,(str,unicode)):
+            if not dataview.cmap in cm.__dict__:
+                # unknown colormap, test whether it's in pycortex colormaps
+                cmapdir = config.get('webgl', 'colormaps')
+                colormaps = glob.glob(os.path.join(cmapdir, "*.png"))
+                colormaps = dict(((os.path.split(c)[1][:-4],c) for c in colormaps))
+                if not dataview.cmap in colormaps:
+                    raise Exception('Unkown color map!')
+                I = plt.imread(colormaps[dataview.cmap])
+                cmap = colors.ListedColormap(np.squeeze(I))
+                # Register colormap while we're at it
+                cm.register_cmap(dataview.cmap,cmap)
+            else:
+                cmap = dataview.cmap
+        elif isinstance(dataview.cmap,colors.Colormap):
+            # Allow input of matplotlib colormap class
+            cmap = dataview.cmap
+
+        cmapdict.update(cmap=cmap, 
+                        vmin=dataview.vmin, 
+                        vmax=dataview.vmax)
+
+    return cmapdict
+
+
 
 def is_str(obj):
     try:

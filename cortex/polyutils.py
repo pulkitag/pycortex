@@ -1,6 +1,6 @@
 from collections import OrderedDict
 import numpy as np
-from scipy.spatial import distance, Delaunay, cKDTree
+from scipy.spatial import distance, Delaunay
 from scipy import sparse
 import scipy.sparse.linalg
 import functools
@@ -12,7 +12,7 @@ def _memo(fn):
     dozens of times.
     """
     @functools.wraps(fn)
-    def memofn(self):
+    def memofn(self, *args, **kwargs):
         if id(fn) not in self._cache:
             self._cache[id(fn)] = fn(self)
         return self._cache[id(fn)]
@@ -36,7 +36,7 @@ class Surface(object):
         polys : 2D ndarray, shape (total_polys, 3)
             Indices of the vertices in each triangle in the surface.
         """
-        self.pts = pts
+        self.pts = pts.astype(np.double)
         self.polys = polys
 
         self._cache = dict()
@@ -74,7 +74,8 @@ class Surface(object):
                                   (self.polys[:,0], self.polys[:,2])), (npt,npt))
         adj3 = sparse.coo_matrix((np.ones((npoly,)),
                                   (self.polys[:,1], self.polys[:,2])), (npt,npt))
-        return (adj1 + adj2 + adj3).tocsr()
+        alladj = (adj1 + adj2 + adj3).tocsr()
+        return alladj + alladj.T
     
     @property
     @_memo
@@ -108,7 +109,7 @@ class Surface(object):
         nnfnorms = np.cross(self.ppts[:,1] - self.ppts[:,0], 
                             self.ppts[:,2] - self.ppts[:,0])
         # Compute vector length
-        return np.sqrt((nnfnorms**2).sum(-1))
+        return np.sqrt((nnfnorms**2).sum(-1)) / 2
 
     @property
     @_memo
@@ -196,7 +197,7 @@ class Surface(object):
         curv = (L.dot(self.pts) * self.vertex_normals).sum(1)
         return curv
 
-    def smooth(self, scalars, factor=1.0):
+    def smooth(self, scalars, factor=1.0, iterations=1):
         """Smooth vertex-wise function given by `scalars` across the surface using
         mean curvature flow method (see http://brickisland.net/cs177fa12/?p=302).
 
@@ -209,6 +210,8 @@ class Surface(object):
             supplied by mean_curvature.
         factor : float, optional
             Amount of smoothing to perform, larger values smooth more.
+        iterations : int, optional
+            Number of times to repeat smoothing, larger values smooths more.
 
         Returns
         -------
@@ -223,9 +226,12 @@ class Surface(object):
         lfac = sparse.dia_matrix((D,[0]), (npt,npt)) - factor * (W-V)
         goodrows = np.nonzero(~np.array(lfac.sum(0) == 0).ravel())[0]
         lfac_solver = sparse.linalg.dsolve.factorized(lfac[goodrows][:,goodrows])
-        goodsmscalars = lfac_solver((D * scalars)[goodrows])
+        to_smooth = scalars.copy()
+        for _ in range(iterations):
+            from_smooth = lfac_solver((D * to_smooth)[goodrows])
+            to_smooth[goodrows] = from_smooth
         smscalars = np.zeros(scalars.shape)
-        smscalars[goodrows] = goodsmscalars
+        smscalars[goodrows] = from_smooth
         return smscalars
         
     @property
@@ -233,7 +239,7 @@ class Surface(object):
     def avg_edge_length(self):
         """Average length of all edges in the surface.
         """
-        adj = self.laplace_operator[1] # use laplace operator as adjacency matrix
+        adj = self.adj
         tadj = sparse.triu(adj, 1) # only entries above main diagonal, in coo format
         edgelens = np.sqrt(((self.pts[tadj.row] - self.pts[tadj.col])**2).sum(1))
         return edgelens.mean()
@@ -282,7 +288,7 @@ class Surface(object):
         squared Laplace-Beltrami operator is separated into left-hand-side (L2) and
         right-hand-side (Dinv) parts. If we write the L-B operator as the product of
         the stiffness matrix (V-W) and the inverse mass matrix (Dinv), the biharmonic
-        problem is as follows (with `\b` denoting non-boundary vertices)
+        problem is as follows (with `\\b` denoting non-boundary vertices)
 
         .. math::
         
@@ -325,10 +331,10 @@ class Surface(object):
         
         lhs = (V-W).dot(L) # construct left side, almost squared L-B operator
         lhsfac = cholesky(lhs[notboundary][:,notboundary]) # factorize
-        #raise Exception
+        
         return lhs, D, Dinv, lhsfac, notboundary
 
-    def _create_interp(self, verts, bhsolver=None, newinterp=True):
+    def _create_interp(self, verts, bhsolver=None):
         """Creates interpolator that will interpolate values at the given `verts` using
         biharmonic interpolation.
 
@@ -383,7 +389,7 @@ class Surface(object):
 
         Using this function directly is unnecessarily expensive if you want to interpolate
         many different values between the same knot points. Instead, you should directly
-        create and interpolator function using _create_interp, and then call that function.
+        create an interpolator function using _create_interp, and then call that function.
         In fact, that's exactly what this function does.
 
         See _create_biharmonic_solver for math details.
@@ -411,6 +417,31 @@ class Surface(object):
         fe23 = np.cross(fnorms, ppts[:,2] - ppts[:,1])
         fe31 = np.cross(fnorms, ppts[:,0] - ppts[:,2])
         return fe12, fe23, fe31
+
+    def approx_geodesic_distance(self, verts, m=0.1):
+        npt = len(self.pts)
+        t = m * self.avg_edge_length ** 2 # time of heat evolution
+
+        if m not in self._rlfac_solvers:
+            B, D, W, V = self.laplace_operator
+            nLC = W - V # negative laplace matrix
+            spD = sparse.dia_matrix((D,[0]), (npt,npt)).tocsr() # lumped mass matrix
+            
+            lfac = spD - t * nLC # backward Euler matrix
+
+            # Exclude rows with zero weight (these break the sparse LU, that finicky fuck)
+            goodrows = np.nonzero(~np.array(lfac.sum(0) == 0).ravel())[0]
+            self._goodrows = goodrows
+            self._rlfac_solvers[m] = sparse.linalg.dsolve.factorized(lfac[goodrows][:,goodrows])
+
+        # Solve system to get u, the heat values
+        u0 = np.zeros((npt,)) # initial heat values
+        u0[verts] = 1.0
+        goodu = self._rlfac_solvers[m](u0[self._goodrows])
+        u = np.zeros((npt,))
+        u[self._goodrows] = goodu
+
+        return -4 * t * np.log(u)
 
     def geodesic_distance(self, verts, m=1.0, fem=False):
         """Minimum mesh geodesic distance (in mm) from each vertex in surface to any
@@ -448,7 +479,7 @@ class Surface(object):
             vertex in `verts`.
         """
         npt = len(self.pts)
-        if m not in self._rlfac_solvers:
+        if m not in self._rlfac_solvers or m not in self._nLC_solvers:
             B, D, W, V = self.laplace_operator
             nLC = W - V # negative laplace matrix
             if not fem:
@@ -482,7 +513,6 @@ class Surface(object):
         X = np.nan_to_num(ne.evaluate("-graduT / sqrt(gusum)").T)
 
         # Compute integrated divergence of X at each vertex
-        ppts = self.ppts
         #x1 = x2 = x3 = np.zeros((X.shape[0],))
         c32, c13, c21 = self._cot_edge
         x1 = 0.5 * (c32 * X).sum(1)
@@ -900,7 +930,7 @@ def rasterize(poly, shape=(256, 256)):
     import subprocess as sp
     import cStringIO
     import shlex
-    import Image
+    from PIL import Image
     
     polygon = " ".join(["%0.3f,%0.3f"%tuple(p[::-1]) for p in np.array(poly)-(.5, .5)])
     cmd = 'convert -size %dx%d xc:black -fill white -stroke none -draw "polygon %s" PNG32:-'%(shape[0], shape[1], polygon)
@@ -919,8 +949,6 @@ def rasterize(poly, shape=(256, 256)):
 
 def voxelize(pts, polys, shape=(256, 256, 256), center=(128, 128, 128), mp=True):
     from tvtk.api import tvtk
-    import Image
-    import ImageDraw
     
     pd = tvtk.PolyData(points=pts + center + (0, 0, 0), polys=polys)
     plane = tvtk.Planes(normals=[(0,0,1)], points=[(0,0,0)])
@@ -956,3 +984,24 @@ def measure_volume(pts, polys):
     pd = tvtk.PolyData(points=pts, polys=polys)
     mp = tvtk.MassProperties(input=pd)
     return mp.volume
+
+def marching_cubes(volume, smooth=True, decimate=True, **kwargs):
+    import tvtk
+    imgdata = tvtk.ImageData(dimensions=volume.shape)
+    imgdata.point_data.scalars = volume.flatten('F')
+
+    contours = tvtk.ContourFilter(input=imgdata, number_of_contours=1)
+    contours.set_value(0, 1)
+
+    if smooth:
+        smoothargs = dict(number_of_iterations=40, feature_angle = 90, pass_band=.05)
+        smoothargs.update(kwargs)
+        contours = tvtk.WindowedSincPolyDataFilter(input=contours.output, **smoothargs)
+    if decimate:
+        contours = tvtk.QuadricDecimation(input=contours.output, target_reduction=.75)
+    
+    contours.update()
+    pts = contours.output.points.to_array()
+    polys = contours.output.polys.to_array().reshape(-1, 4)[:,1:]
+    return pts, polys
+

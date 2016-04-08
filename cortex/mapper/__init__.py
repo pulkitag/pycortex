@@ -9,7 +9,7 @@ warnings.simplefilter('ignore', sparse.SparseEfficiencyWarning)
 from .. import dataset
 
 def get_mapper(subject, xfmname, type='nearest', recache=False, **kwargs):
-    from ..db import surfs
+    from ..database import db
     from . import point, patch, volume, line
 
     mapcls = dict(
@@ -30,20 +30,20 @@ def get_mapper(subject, xfmname, type='nearest', recache=False, **kwargs):
 
     fname = "{xfmname}_{projection}.npz".format(xfmname=xfmname, projection=ptype)
 
-    xfmfile = surfs.getFiles(subject)['xfmdir'].format(xfmname=xfmname)
-    cachefile = os.path.join(surfs.getCache(subject), fname)
+    xfmfile = db.get_paths(subject)['xfmdir'].format(xfmname=xfmname)
+    cachefile = os.path.join(db.get_cache(subject), fname)
 
     try:
-        if not recache and xfmname == "identity" or os.stat(cachefile).st_mtime > os.stat(xfmfile).st_mtime:
-           return mapcls[type].from_cache(cachefile) 
+        if not recache and (xfmname == "identity" or os.stat(cachefile).st_mtime > os.stat(xfmfile).st_mtime):
+           return mapcls[type].from_cache(cachefile)
         raise Exception
     except Exception as e:
         return mapcls[type]._cache(cachefile, subject, xfmname, **kwargs)
 
 def _savecache(filename, left, right, shape):
-    np.savez(filename, 
-            left_data=left.data, 
-            left_indices=left.indices, 
+    np.savez(filename,
+            left_data=left.data,
+            left_indices=left.indices,
             left_indptr=left.indptr,
             left_shape=left.shape,
             right_data=right.data,
@@ -85,9 +85,9 @@ class Mapper(object):
 
     def __call__(self, data):
         if isinstance(data, tuple):
-            data = dataset.VolumeData(*data)
+            data = dataset.Volume(*data)
 
-        if isinstance(data, dataset.VertexData):
+        if isinstance(data, dataset.Vertex):
             llen = self.masks[0].shape[0]
             if data.raw:
                 left, right = data.data[..., :llen,:], data.data[..., llen:,:]
@@ -101,25 +101,20 @@ class Mapper(object):
                     right = right[..., self.idxmap[1]]
             return left, right
 
-        if data.raw:
-            raise ValueError('Mapping raw data is unsupported')
-
-        volume = data.volume
-        if not data.movie:
-            volume = volume[np.newaxis]
+        volume = np.ascontiguousarray(data.volume)
         volume.shape = len(volume), -1
         volume = volume.T
 
         mapped = []
         for mask in self.masks:
             mapped.append(np.array(mask * volume).T)
-            
+
         if self.idxmap is not None:
             mapped[0] = mapped[0][:, self.idxmap[0]]
             mapped[1] = mapped[1][:, self.idxmap[1]]
 
-        return dataset.VertexData(np.hstack(mapped).squeeze(), data.subject)
-        
+        return dataset.Vertex(np.hstack(mapped).squeeze(), data.subject)
+
     def backwards(self, verts, fast=True):
         '''Projects vertex data back into volume space
 
@@ -131,7 +126,7 @@ class Mapper(object):
         '''
         left = np.zeros((self.masks[0].shape[0],), dtype=bool)
         right = np.zeros((self.masks[1].shape[0],), dtype=bool)
-        
+
         if len(verts) > 0:
             if isinstance(verts, (list, tuple)) and len(verts) == 2:
                 if len(verts[0]) == len(left):
@@ -162,15 +157,18 @@ class Mapper(object):
     @classmethod
     def _cache(cls, filename, subject, xfmname, **kwargs):
         print('Caching mapper...')
-        from ..db import surfs
+        from ..database import db
         masks = []
-        xfm = surfs.getXfm(subject, xfmname, xfmtype='coord')
-        fid = surfs.getSurf(subject, 'fiducial', merge=False, nudge=False)
-        flat = surfs.getSurf(subject, 'flat', merge=False, nudge=False)
+        xfm = db.get_xfm(subject, xfmname, xfmtype='coord')
+        fid = db.get_surf(subject, 'fiducial', merge=False, nudge=False)
+
+        try:
+            flat = db.get_surf(subject, 'flat', merge=False, nudge=False)
+        except IOError:
+            flat = fid
 
         for (pts, _), (_, polys) in zip(fid, flat):
             masks.append(cls._getmask(xfm(pts), polys, xfm.shape, **kwargs))
 
         _savecache(filename, masks[0], masks[1], xfm.shape)
         return cls(masks[0], masks[1], xfm.shape)
-        

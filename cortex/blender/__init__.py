@@ -8,6 +8,7 @@ import numpy as np
 
 from .. import freesurfer
 from .. import dataset
+from .. import utils 
 
 _base_imports = """import sys
 sys.path.insert(0, '{path}')
@@ -23,12 +24,12 @@ def _call_blender(filename, code):
     New files will be initially cleared by deleting all objects.
     """
     with tempfile.NamedTemporaryFile() as tf:
+        print("In new named temp file: %s"%tf.name)
         startcode=_base_imports
         endcode = "\nbpy.ops.wm.save_mainfile(filepath='{fname}')".format(fname=filename)
         cmd = "blender -b {fname} -P {tfname}".format(fname=filename, tfname=tf.name)
         if not os.path.exists(filename):
             startcode += "blendlib.clear_all()\n"
-            endcode = "\nbpy.ops.wm.save_mainfile(filepath='{fname}')".format(fname=filename)
             cmd = "blender -b -P {tfname}".format(tfname=tf.name)
 
         tf.write(startcode+code+endcode)
@@ -38,11 +39,11 @@ def _call_blender(filename, code):
 def add_cutdata(fname, dataview, name="retinotopy", projection="nearest", mesh="hemi"):
     from matplotlib import cm
     dataview = dataset.normalize(dataview)
-    mapped = dataview.data.map(projection)
+    mapped = dataview.map(projection)
     left = mapped.left
     right = mapped.right
 
-    cmap = cm.get_cmap(dataview.cmap)
+    cmap = utils.get_cmap(dataview.cmap)
     vmin = dataview.vmin
     vmax = dataview.vmax
     lcolor = cmap((left - vmin) / (vmax - vmin))[:,:3]
@@ -71,9 +72,46 @@ def add_cutdata(fname, dataview, name="retinotopy", projection="nearest", mesh="
 
     return 
 
-def fs_cut(fname, subject, hemi):
-    wpts, polys, curv = freesurfer.get_surf(subject, hemi, 'smoothwm')
-    ipts, _, _ = freesurfer.get_surf(subject, hemi, 'inflated')
+
+def gii_cut(fname, subject, hemi):
+    '''
+    Add gifti surface to blender
+    '''
+    from ..database import db
+    hemis = dict(lh='left',
+                 rh='right')
+    
+    wpts, polys = db.get_surf(subject, 'wm', hemi)
+    ipts, _ = db.get_surf(subject, 'very_inflated', hemi)
+    curvature = db.getSurfInfo(subject, 'curvature')
+    rcurv = curvature.__getattribute__(hemis[hemi])
+
+    p = xdrlib.Packer()
+    p.pack_array(wpts.ravel(), p.pack_double)
+    p.pack_array(ipts.ravel(), p.pack_double)
+    p.pack_array(polys.ravel(), p.pack_uint)
+    p.pack_array(rcurv.ravel(), p.pack_double)
+    with tempfile.NamedTemporaryFile() as tf:
+        tf.write(p.get_buffer())
+        tf.flush()
+        code = """with open('{tfname}', 'rb') as fp:
+            u = xdrlib.Unpacker(fp.read())
+            wpts = u.unpack_array(u.unpack_double)
+            ipts = u.unpack_array(u.unpack_double)
+            polys = u.unpack_array(u.unpack_uint)
+            curv = u.unpack_array(u.unpack_double)
+            blendlib.init_subject(wpts, ipts, polys, curv)
+        """.format(tfname=tf.name)
+        _call_blender(fname, code)
+
+
+def fs_cut(fname, subject, hemi, freesurfer_subject_dir=None):
+    """Cut freesurfer surface using blender interface
+
+    if `freesurfer_subject_dir` is None, it defaults to SUBJECTS_DIR environment variable
+    """
+    wpts, polys, curv = freesurfer.get_surf(subject, hemi, 'smoothwm', freesurfer_subject_dir=freesurfer_subject_dir)
+    ipts, _, _ = freesurfer.get_surf(subject, hemi, 'inflated', freesurfer_subject_dir=freesurfer_subject_dir)
     rcurv = np.clip(((-curv + .6) / 1.2), 0, 1)
     p = xdrlib.Packer()
     p.pack_array(wpts.ravel(), p.pack_double)
@@ -110,3 +148,4 @@ def write_patch(bname, pname, mesh="hemi"):
             blendlib.save_patch(pname, mesh)
         """.format(tfname=tf.name)
         _call_blender(bname, code)
+

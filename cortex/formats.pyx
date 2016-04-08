@@ -12,7 +12,7 @@ from libc.stdlib cimport atoi, atof
 np.import_array()
 
 def read(str globname):
-    readers = OrderedDict([('gii', read_gii), ('npz', read_npz), ('vtk', read_vtk), ('off', read_off)])
+    readers = OrderedDict([('gii', read_gii), ('npz', read_npz), ('vtk', read_vtk), ('off', read_off), ('stl', read_stl)])
     for ext, func in readers.items():
         try:
             return func(globname+"."+ext)
@@ -36,7 +36,9 @@ def read_off(str filename):
 
 def read_npz(str filename):
     npz = np.load(filename)
-    return npz['pts'], npz['polys']
+    pts, polys = npz['pts'], npz['polys']
+    npz.close()
+    return pts, polys
 
 def read_gii(str filename):
     from nibabel import gifti
@@ -44,6 +46,32 @@ def read_gii(str filename):
     pts = gii.getArraysFromIntent('pointset')[0].data
     polys = gii.getArraysFromIntent('triangle')[0].data
     return pts, polys
+
+@cython.boundscheck(False)
+def read_stl(str filename):
+    cdef int i, j
+
+    dtype = np.dtype("3f4, (3,3)f4, H")
+    with open(filename, 'r') as fp:
+        header = fp.read(80)
+        if header[:5] == "solid":
+            raise TypeError("Cannot read ASCII STL files")
+        npolys, = struct.unpack('I', fp.read(4))
+        data = np.fromstring(fp.read(), dtype=dtype)
+        if npolys != len(data):
+            raise ValueError('File invalid')
+
+    idx = dict()
+    polys = np.empty((npolys,3), dtype=np.uint32)
+    points = []
+    for i, pts in enumerate(data['f1']):
+        for j, pt in enumerate(pts):
+            if tuple(pt) not in idx:
+                idx[tuple(pt)] = len(idx)
+                points.append(tuple(pt))
+            polys[i, j] = idx[tuple(pt)]
+
+    return np.array(points), polys
 
 @cython.boundscheck(False)
 def read_vtk(str filename):
@@ -123,6 +151,8 @@ def write_stl(bytes filename, object pts, object polys):
     with open(filename, 'w') as fp:
         fp.write(struct.pack('80xI', len(polys)))
         fp.write(data.tostring())
+
+
 
 def write_gii(bytes filename, object pts, object polys):
     from nibabel import gifti

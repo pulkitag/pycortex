@@ -11,7 +11,7 @@ def manual(subject, xfmname, reference=None, **kwargs):
 
     <<ADD DETAILS ABOUT TRANSFORMATION MATRIX FORMAT HERE>>
 
-    When the GUI is closed, the transform will be saved into the pycortex database. The GUI requires 
+    When the GUI is closed, the transform will be saved into the pycortex database. The GUI requires
     Mayavi support.
 
     Parameters
@@ -32,53 +32,57 @@ def manual(subject, xfmname, reference=None, **kwargs):
     m : 2D ndarray, shape (4, 4)
         Transformation matrix.
     """
-    from .db import surfs
+    from .database import db
     from .mayavi_aligner import get_aligner
     def save_callback(aligner):
-        surfs.loadXfm(subject, xfmname, aligner.get_xfm("magnet"), xfmtype='magnet', reference=reference)
+        db.save_xfm(subject, xfmname, aligner.get_xfm("magnet"), xfmtype='magnet', reference=reference)
         print("saved xfm")
 
+    def view_callback(aligner):
+        print('view-only mode! ignoring changes')
+
     # Check whether transform w/ this xfmname already exists
+    view_only_mode = False
     try:
-        surfs.getXfm(subject, xfmname)
+        db.get_xfm(subject, xfmname)
         # Transform exists, make sure that reference is None
         if reference is not None:
             raise ValueError('Refusing to overwrite reference for existing transform %s, use reference=None to load stored reference' % xfmname)
+
+        # if masks have been cached, quit! user must remove them by hand
+        from glob import glob
+        if len(glob(db.get_paths(subject)['masks'].format(xfmname=xfmname, type='*'))):
+            print('Refusing to overwrite existing transform %s because there are cached masks. Delete the masks manually if you want to modify the transform.' % xfmname)
+            checked = False
+            while not checked:
+                resp = raw_input("Do you want to continue in view-only mode? (Y/N) ").lower().strip()
+                if resp in ["y", "yes", "n", "no"]:
+                    checked = True
+                    if resp in ["y", "yes"]:
+                        view_only_mode = True
+                        print("Continuing in view-only mode...")
+                    else:
+                        raise ValueError("Exiting...")
+                else:
+                    print("Didn't get that, please try again..")
     except IOError:
         # Transform does not exist, make sure that reference exists
         if reference is None or not os.path.exists(reference):
             raise ValueError('Reference image file (%s) does not exist' % reference)
 
-    m = get_aligner(subject, xfmname, epifile=reference, **kwargs)
-    m.save_callback = save_callback
-    m.configure_traits()
-    
-    magnet = m.get_xfm("magnet")
-    epi = os.path.abspath(m.epi_file.get_filename())
 
-    checked = False
-    while not checked:
-        resp = raw_input("Save? (Y/N) ").lower().strip()
-        if resp in ["y", "yes", "n", "no"]:
-            checked = True
-            if resp in ["y", "yes"]:
-                print("Saving...")
-                try:
-                    surfs.loadXfm(subject, xfmname, magnet, xfmtype='magnet', reference=reference)
-                except Exception as e:
-                    print("AN ERROR OCCURRED, THE TRANSFORM WAS NOT SAVED: %s"%e)
-                print("Complete!")
-            else:
-                print("Cancelled... %s"%resp)
-        else:
-            print("Didn't get that, please try again..")
-    
+
+
+    m = get_aligner(subject, xfmname, epifile=reference, **kwargs)
+    m.save_callback = view_callback if view_only_mode else save_callback
+    m.configure_traits()
+
     return m
 
-def automatic(subject, xfmname, reference, noclean=False):
-    """Create an automatic alignment using the FLIRT boundary-based alignment (BBR) from FSL. 
+def automatic(subject, xfmname, reference, noclean=False, bbrtype="signed"):
+    """Create an automatic alignment using the FLIRT boundary-based alignment (BBR) from FSL.
 
-    If `noclean`, intermediate files will not be removed from /tmp. The `reference` image and resulting 
+    If `noclean`, intermediate files will not be removed from /tmp. The `reference` image and resulting
     transform called `xfmname` will be automatically stored in the database.
 
     It's good practice to open up this transform afterward in the manual aligner and check how it worked.
@@ -107,7 +111,7 @@ def automatic(subject, xfmname, reference, noclean=False):
     import tempfile
     import subprocess as sp
 
-    from .db import surfs
+    from .database import db
     from .xfm import Transform
     from .options import config
 
@@ -118,26 +122,27 @@ def automatic(subject, xfmname, reference, noclean=False):
     try:
         cache = tempfile.mkdtemp()
         absreference = os.path.abspath(reference)
-        raw = surfs.getAnat(subject, type='raw').get_filename()
-        bet = surfs.getAnat(subject, type='brainmask').get_filename()
-        wmseg = surfs.getAnat(subject, type='whitematter').get_filename()
-        # Compute anatomical-to-epi transform
+        raw = db.get_anat(subject, type='raw').get_filename()
+        bet = db.get_anat(subject, type='brainmask').get_filename()
+        wmseg = db.get_anat(subject, type='whitematter').get_filename()
+        #Compute anatomical-to-epi transform
         print('FLIRT pre-alignment')
         cmd = '{fslpre}flirt  -in {epi} -ref {bet} -dof 6 -omat {cache}/init.mat'.format(
-            fslpre=fsl_prefix, cache=cache, epi=absreference, bet=bet)
+           fslpre=fsl_prefix, cache=cache, epi=absreference, bet=bet)
         if sp.call(cmd, shell=True) != 0:
-            raise IOError('Error calling initial FLIRT')
+           raise IOError('Error calling initial FLIRT')
+
         print('Running BBR')
         # Run epi-to-anat transform (this is more stable than anat-to-epi in FSL!)
-        cmd = '{fslpre}flirt -in {epi} -ref {raw} -dof 6 -cost bbr -wmseg {wmseg} -init {cache}/init.mat -omat {cache}/out.mat -schedule {schfile}'
-        cmd = cmd.format(fslpre=fsl_prefix, cache=cache, raw=raw, wmseg=wmseg, epi=absreference, schfile=schfile)
+        cmd = '{fslpre}flirt -in {epi} -ref {raw} -dof 6 -cost bbr -wmseg {wmseg} -init {cache}/init.mat -omat {cache}/out.mat -schedule {schfile} -bbrtype {bbrtype}'
+        cmd = cmd.format(fslpre=fsl_prefix, cache=cache, raw=bet, wmseg=wmseg, epi=absreference, schfile=schfile, bbrtype=bbrtype)
         if sp.call(cmd, shell=True) != 0:
             raise IOError('Error calling BBR flirt')
 
         x = np.loadtxt(os.path.join(cache, "out.mat"))
-        # Pass transform as FROM epi TO anat; transform will be inverted 
-        # back to anat-to-epi, standard direction for pycortex internal 
-        # storage by from_fsl 
+        # Pass transform as FROM epi TO anat; transform will be inverted
+        # back to anat-to-epi, standard direction for pycortex internal
+        # storage by from_fsl
         xfm = Transform.from_fsl(x,absreference,raw)
         # Save as pycortex 'coord' transform
         xfm.save(subject,xfmname,'coord')
@@ -168,29 +173,33 @@ def autotweak(subject, xfmname):
     import tempfile
     import subprocess as sp
 
-    from .db import surfs
+    from .database import db
     from .xfm import Transform
+    from .options import config
 
-    magnet = surfs.getXfm(subject, xfmname, xfmtype='magnet')
+    fsl_prefix = config.get("basic", "fsl_prefix")
+    schfile = os.path.join(os.path.split(os.path.abspath(__file__))[0], "bbr.sch")
+
+    magnet = db.get_xfm(subject, xfmname, xfmtype='magnet')
     try:
         cache = tempfile.mkdtemp()
         epifile = magnet.reference.get_filename()
-        raw = surfs.getAnat(subject, type='raw').get_filename()
-        bet = surfs.getAnat(subject, type='brainmask').get_filename()
-        wmseg = surfs.getAnat(subject, type='whitematter').get_filename()
-        initmat = magnet.to_fsl(surfs.getAnat(subject, 'raw').get_filename())
+        raw = db.get_anat(subject, type='raw').get_filename()
+        bet = db.get_anat(subject, type='brainmask').get_filename()
+        wmseg = db.get_anat(subject, type='whitematter').get_filename()
+        initmat = magnet.to_fsl(db.get_anat(subject, 'raw').get_filename())
         with open(os.path.join(cache, 'init.mat'), 'w') as fp:
             np.savetxt(fp, initmat, fmt='%f')
         print('Running BBR')
-        cmd = 'fsl5.0-flirt -in {epi} -ref {raw} -dof 6 -cost bbr -wmseg {wmseg} -init {cache}/init.mat -omat {cache}/out.mat -schedule /usr/share/fsl/5.0/etc/flirtsch/bbr.sch'
+        cmd = '{fslpre}flirt -in {epi} -ref {raw} -dof 6 -cost bbr -wmseg {wmseg} -init {cache}/init.mat -omat {cache}/out.mat -schedule {schfile}'
         cmd = cmd.format(cache=cache, raw=raw, wmseg=wmseg, epi=epifile)
         if sp.call(cmd, shell=True) != 0:
             raise IOError('Error calling BBR flirt')
 
         x = np.loadtxt(os.path.join(cache, "out.mat"))
-        # Pass transform as FROM epi TO anat; transform will be inverted 
-        # back to anat-to-epi, standard direction for pycortex internal 
-        # storage by from_fsl 
+        # Pass transform as FROM epi TO anat; transform will be inverted
+        # back to anat-to-epi, standard direction for pycortex internal
+        # storage by from_fsl
         Transform.from_fsl(x, epifile, raw).save(subject, xfmname+"_auto", 'coord')
         print('Saved transform as (%s, %s)'%(subject, xfmname+'_auto'))
     finally:
